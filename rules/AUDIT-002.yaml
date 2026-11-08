@@ -1,0 +1,96 @@
+id: a94a36ed-ed0f-45f0-a446-82624edc4ecc
+ruleId: AUDIT-002
+name: New credential added to an app registration or service principal
+description: |
+  A client secret or certificate was added to an application or service principal. Attackers add
+  their own credential to an existing app that already has broad API permissions, then sign in as
+  that app - access that survives password resets and does not need MFA.
+severity: High
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes: [AuditLogs]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [Persistence, PrivilegeEscalation]
+relevantTechniques: [T1098.001]
+query: |
+  let lookback = 1h;
+  AuditLogs
+  | where TimeGenerated > ago(lookback)
+  | where OperationName in ("Add service principal credentials",
+      "Update application – Certificates and secrets management")
+  | where Result =~ "success"
+  | mv-expand TargetResource = TargetResources
+  | extend AppName = tostring(TargetResource.displayName),
+           AppObjectId = tostring(TargetResource.id),
+           TargetType = tostring(TargetResource.type),
+           InitiatedByUser = tostring(InitiatedBy.user.userPrincipalName),
+           InitiatedByApp = tostring(InitiatedBy.app.displayName),
+           InitiatorIP = tostring(InitiatedBy.user.ipAddress)
+  | where isnotempty(AppName)
+  | extend Initiator = iff(isnotempty(InitiatedByUser), InitiatedByUser, InitiatedByApp)
+  | project TimeGenerated, OperationName, AppName, AppObjectId, TargetType, Initiator, InitiatorIP, CorrelationId
+entityMappings:
+  - entityType: CloudApplication
+    fieldMappings:
+      - identifier: Name
+        columnName: AppName
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Initiator
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: InitiatorIP
+triage:
+  steps:
+    - Check which API permissions the app holds (Microsoft Graph Mail.Read, Directory.ReadWrite.All and similar make this critical).
+    - Ask the app's owner and the Initiator whether a secret or certificate rotation was planned.
+    - Look for sign-ins by the service principal (AADServicePrincipalSignInLogs) after TimeGenerated from unfamiliar IPs.
+    - Check the Initiator's own sign-ins for compromise around TimeGenerated.
+    - If unplanned, remove the new credential, review what the app accessed, and reset the Initiator's credentials.
+  falsePositives:
+    - Scheduled secret or certificate rotation by the app's owners or by automation.
+    - CI/CD pipelines that create short-lived credentials for deployments.
+  escalateWhen: |
+    Escalate if no owner confirms it and the app holds tenant-wide or mail/file-read permissions.
+tests:
+  - name: secret added to an app by a user fires
+    data:
+      AuditLogs:
+        - at: -10m
+          OperationName: "Update application – Certificates and secrets management"
+          Category: ApplicationManagement
+          Result: success
+          InitiatedBy: { user: { userPrincipalName: admin@example.com, ipAddress: 203.0.113.110 } }
+          TargetResources:
+            - { id: 0a1b2c3d-0000-4000-8000-0000000000aa, displayName: HR-Sync, type: Application }
+    expect:
+      rows: 1
+      match: { AppName: HR-Sync, Initiator: admin@example.com, InitiatorIP: 203.0.113.110 }
+  - name: service principal credential added by an app fires with the app as initiator
+    data:
+      AuditLogs:
+        - at: -10m
+          OperationName: Add service principal credentials
+          Result: success
+          InitiatedBy: { app: { displayName: Deploy-Pipeline } }
+          TargetResources:
+            - { id: 0a1b2c3d-0000-4000-8000-0000000000bb, displayName: Reporting-API, type: ServicePrincipal }
+    expect:
+      rows: 1
+      match: { AppName: Reporting-API, Initiator: Deploy-Pipeline }
+  - name: unrelated app updates do not fire
+    data:
+      AuditLogs:
+        - at: -10m
+          OperationName: Update application
+          Result: success
+          InitiatedBy: { user: { userPrincipalName: admin@example.com } }
+          TargetResources:
+            - { id: 0a1b2c3d-0000-4000-8000-0000000000aa, displayName: HR-Sync, type: Application }
+    expect: { rows: 0 }

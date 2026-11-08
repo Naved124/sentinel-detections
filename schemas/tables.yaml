@@ -1,0 +1,61 @@
+# Column subsets of the Microsoft Sentinel / Log Analytics tables these rules use.
+# Names and types follow the Azure Monitor Logs table reference. Only the columns
+# the rules and tests need are listed; adding more is harmless.
+
+SigninLogs:
+  TimeGenerated: datetime
+  UserPrincipalName: string
+  UserDisplayName: string
+  UserId: string
+  IPAddress: string
+  Location: string
+  LocationDetails: dynamic
+  ResultType: string
+  ResultDescription: string
+  AppDisplayName: string
+  ClientAppUsed: string
+  UserAgent: string
+  AuthenticationRequirement: string
+  ConditionalAccessStatus: string
+  Status: dynamic
+  RiskLevelDuringSignIn: string
+  CorrelationId: string
+
+AuditLogs:
+  TimeGenerated: datetime
+  OperationName: string
+  Category: string
+  Result: string
+  ResultReason: string
+  LoggedByService: string
+  InitiatedBy: dynamic
+  TargetResources: dynamic
+  AdditionalDetails: dynamic
+  CorrelationId: string
+
+AzureActivity:
+  TimeGenerated: datetime
+  OperationNameValue: string
+  OperationName: string
+  ActivityStatusValue: string
+  ActivitySubstatusValue: string
+  Caller: string
+  CallerIpAddress: string
+  CategoryValue: string
+  ResourceGroup: string
+  SubscriptionId: string
+  _ResourceId: string
+  CorrelationId: string
+  Properties_d: dynamic
+  Authorization_d: dynamic
+
+Syslog:
+  TimeGenerated: datetime
+  Computer: string
+  HostName: string
+  HostIP: string
+  Facility: string
+  SeverityLevel: string
+  ProcessName: string
+  ProcessID: int
+  SyslogMessage: string

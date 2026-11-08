@@ -1,0 +1,88 @@
+id: ebb39e7f-2aa7-42ab-b30a-ad6d2866c385
+ruleId: SIGNIN-003
+name: MFA fatigue - repeated MFA denials for one account
+description: |
+  An account denied three or more MFA prompts within an hour. Attackers who already have a
+  password send prompt after prompt hoping the user approves one to make them stop (MFA fatigue
+  or push bombing). The alert flags whether an MFA sign-in was approved after the denials began.
+severity: High
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes: [SigninLogs]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [CredentialAccess]
+relevantTechniques: [T1621]
+query: |
+  let lookback = 1h;
+  let min_denials = 3;
+  let denials = SigninLogs
+      | where TimeGenerated > ago(lookback)
+      // 500121: authentication failed during the strong authentication (MFA) request
+      | where ResultType == "500121"
+      | extend Detail = tostring(Status.additionalDetails)
+      | where Detail contains "denied" or Detail contains "declined" or Detail contains "fraud"
+      | summarize Denials = count(), FirstDenial = min(TimeGenerated), LastDenial = max(TimeGenerated),
+          SourceIPs = make_set(IPAddress, 20), Details = make_set(Detail, 5)
+          by UserPrincipalName
+      | where Denials >= min_denials;
+  let approvals = SigninLogs
+      | where TimeGenerated > ago(lookback)
+      | where ResultType == "0" and AuthenticationRequirement == "multiFactorAuthentication"
+      | project ApprovedAt = TimeGenerated, UserPrincipalName, ApprovedFromIP = IPAddress;
+  denials
+  | join kind=leftouter approvals on UserPrincipalName
+  | extend ApprovedAt = iff(ApprovedAt > FirstDenial, ApprovedAt, datetime(null)),
+           ApprovedFromIP = iff(ApprovedAt > FirstDenial, ApprovedFromIP, "")
+  | summarize ApprovedAt = min(ApprovedAt), ApprovedFromIP = take_anyif(ApprovedFromIP, isnotempty(ApprovedFromIP))
+      by UserPrincipalName, Denials, FirstDenial, LastDenial, tostring(SourceIPs), tostring(Details)
+  | extend ApprovedAfterDenials = isnotnull(ApprovedAt)
+  | project UserPrincipalName, Denials, FirstDenial, LastDenial, ApprovedAfterDenials, ApprovedAt, ApprovedFromIP,
+      SourceIPs = todynamic(SourceIPs), Details = todynamic(Details)
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: UserPrincipalName
+triage:
+  steps:
+    - If ApprovedAfterDenials is true, treat the account as compromised - the attacker likely got a prompt approved.
+    - Call the user. Ask whether they were signing in themselves and whether they approved any prompt.
+    - Compare SourceIPs and ApprovedFromIP with the user's usual locations and devices.
+    - Review the account's activity after ApprovedAt - new MFA methods registered, mailbox rules, OAuth consents, file access.
+    - Reset the password (the attacker already has it), revoke sessions, and move the user to number matching or phishing-resistant MFA.
+  falsePositives:
+    - A user tapping Deny by mistake on a prompt from their own laptop, then retrying.
+    - A misbehaving app on the user's device that keeps triggering MFA in the background.
+  escalateWhen: |
+    Escalate immediately if ApprovedAfterDenials is true, or if the user did not start any of the
+    sign-ins. Repeated denials mean the attacker already has the password.
+tests:
+  - name: five denials followed by an approval fires and marks it approved
+    data:
+      SigninLogs:
+        - { at: -45m, repeat: 5, every: 1m, UserPrincipalName: carol@example.com, IPAddress: 203.0.113.70, ResultType: "500121", Status: { errorCode: 500121, additionalDetails: "MFA denied; user declined the authentication" } }
+        - { at: -38m, UserPrincipalName: carol@example.com, IPAddress: 203.0.113.70, ResultType: "0", AuthenticationRequirement: multiFactorAuthentication }
+    expect:
+      rows: 1
+      match: { UserPrincipalName: carol@example.com, Denials: 5, ApprovedAfterDenials: true, ApprovedFromIP: 203.0.113.70 }
+  - name: denials without an approval still fire, marked not approved
+    data:
+      SigninLogs:
+        - { at: -45m, repeat: 4, every: 2m, UserPrincipalName: carol@example.com, IPAddress: 203.0.113.70, ResultType: "500121", Status: { errorCode: 500121, additionalDetails: "MFA denied; user declined the authentication" } }
+    expect:
+      rows: 1
+      match: { Denials: 4, ApprovedAfterDenials: false }
+  - name: two denials stay under the threshold
+    data:
+      SigninLogs:
+        - { at: -30m, repeat: 2, every: 1m, UserPrincipalName: carol@example.com, IPAddress: 198.51.100.30, ResultType: "500121", Status: { errorCode: 500121, additionalDetails: "MFA denied; user declined the authentication" } }
+    expect: { rows: 0 }
+  - name: MFA timeouts (not denials) do not count
+    data:
+      SigninLogs:
+        - { at: -30m, repeat: 5, every: 1m, UserPrincipalName: carol@example.com, IPAddress: 198.51.100.30, ResultType: "500121", Status: { errorCode: 500121, additionalDetails: "MFA required in Azure AD" } }
+    expect: { rows: 0 }

@@ -1,0 +1,86 @@
+id: e5d0ce75-ab33-47a5-b823-842573f86503
+ruleId: SYSLOG-002
+name: Successful SSH login after repeated failures from the same IP
+description: |
+  A Linux host accepted an SSH login from an IP address that had already failed five or more
+  times in the same hour. This is the point where an SSH brute force or password guess stops
+  being noise and becomes a likely compromise.
+severity: High
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: Syslog
+    dataTypes: [Syslog]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [CredentialAccess, InitialAccess]
+relevantTechniques: [T1110.001, T1078.003]
+query: |
+  let lookback = 1h;
+  let min_failures = 5;
+  let ssh = Syslog
+      | where TimeGenerated > ago(lookback)
+      | where ProcessName in ("sshd", "sshd-session")
+      | extend SourceIP = extract(@"from (\S+) port \d+", 1, SyslogMessage);
+  let failures = ssh
+      | where SyslogMessage startswith "Failed "
+      | summarize FailedAttempts = count(), FirstFailure = min(TimeGenerated), LastFailure = max(TimeGenerated)
+          by Computer, SourceIP
+      | where FailedAttempts >= min_failures;
+  let logins = ssh
+      | where SyslogMessage startswith "Accepted "
+      | extend AcceptedUser = extract(@"Accepted \S+ for (\S+) from", 1, SyslogMessage),
+               AuthMethod = extract(@"Accepted (\S+) for", 1, SyslogMessage)
+      | project LoginTime = TimeGenerated, Computer, SourceIP, AcceptedUser, AuthMethod;
+  failures
+  | join kind=inner logins on Computer, SourceIP
+  | where LoginTime > FirstFailure
+  | summarize arg_min(LoginTime, AcceptedUser, AuthMethod) by Computer, SourceIP, FailedAttempts, FirstFailure, LastFailure
+  | project Computer, SourceIP, AcceptedUser, AuthMethod, FailedAttempts, FirstFailure, LastFailure, LoginTime
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: Computer
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+  - entityType: Account
+    fieldMappings:
+      - identifier: Name
+        columnName: AcceptedUser
+triage:
+  steps:
+    - Check AuthMethod. A password login after failures is a likely successful guess; a publickey login after password failures may be a person who switched to their key.
+    - Ask the owner of AcceptedUser whether they logged in from SourceIP at LoginTime.
+    - On the host, review what the session did - shell history, sudo use (SYSLOG-003), new users, cron entries, authorized_keys changes, outbound connections.
+    - If not confirmed, isolate the host, kill the session, rotate the account's credentials and keys.
+  falsePositives:
+    - A user who mistyped their password several times and then got it right.
+    - A user whose client tried several keys or passwords before the right one.
+  escalateWhen: |
+    Escalate if the login was by password, if the owner does not confirm it, or if the account
+    then used sudo.
+tests:
+  - name: eight failures then a password login fires
+    data:
+      Syslog:
+        - { at: -40m, repeat: 8, every: 15s, Computer: web-01, ProcessName: sshd, SyslogMessage: "Failed password for deploy from 203.0.113.180 port 50211 ssh2" }
+        - { at: -37m, Computer: web-01, ProcessName: sshd, SyslogMessage: "Accepted password for deploy from 203.0.113.180 port 50299 ssh2" }
+    expect:
+      rows: 1
+      match: { Computer: web-01, SourceIP: 203.0.113.180, AcceptedUser: deploy, AuthMethod: password, FailedAttempts: 8 }
+  - name: login from a different IP is not linked
+    data:
+      Syslog:
+        - { at: -40m, repeat: 8, every: 15s, Computer: web-01, ProcessName: sshd, SyslogMessage: "Failed password for deploy from 203.0.113.180 port 50211 ssh2" }
+        - { at: -30m, Computer: web-01, ProcessName: sshd, SyslogMessage: "Accepted publickey for deploy from 198.51.100.80 port 40111 ssh2: ED25519 SHA256:abc" }
+    expect: { rows: 0 }
+  - name: same IP but on a different host is not linked
+    data:
+      Syslog:
+        - { at: -40m, repeat: 8, every: 15s, Computer: web-01, ProcessName: sshd, SyslogMessage: "Failed password for deploy from 203.0.113.180 port 50211 ssh2" }
+        - { at: -30m, Computer: db-01, ProcessName: sshd, SyslogMessage: "Accepted password for deploy from 203.0.113.180 port 40111 ssh2" }
+    expect: { rows: 0 }

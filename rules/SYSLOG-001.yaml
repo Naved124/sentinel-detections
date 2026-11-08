@@ -1,0 +1,90 @@
+id: 2aca9b26-ac7b-4b7c-a117-311433b91411
+ruleId: SYSLOG-001
+name: SSH brute force against a Linux host
+description: |
+  One source IP produced ten or more failed SSH logins against a Linux host within ten minutes.
+  On an internet-facing server this is constant background noise, so the rule is tuned for
+  awareness and for correlation with SYSLOG-002, which catches the brute force that worked.
+severity: Low
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: Syslog
+    dataTypes: [Syslog]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [CredentialAccess]
+relevantTechniques: [T1110.001]
+query: |
+  let lookback = 1h;
+  let window = 10m;
+  // Fires when any 10 consecutive failures from one IP fall inside the window (a true sliding
+  // window, so a burst that straddles a clock boundary is not split in two).
+  Syslog
+  | where TimeGenerated > ago(lookback)
+  // OpenSSH 9.8+ logs authentication from sshd-session instead of sshd
+  | where ProcessName in ("sshd", "sshd-session")
+  | where SyslogMessage startswith "Failed "
+  | extend SourceIP = extract(@"from (\S+) port \d+", 1, SyslogMessage),
+           TargetUser = extract(@"for (?:invalid user )?(\S+) from", 1, SyslogMessage),
+           InvalidUser = SyslogMessage has "invalid user"
+  | where isnotempty(SourceIP)
+  | extend Key = strcat(Computer, "|", SourceIP)
+  | sort by Key asc, TimeGenerated asc
+  | extend StartKey = prev(Key, 9), StartTime = prev(TimeGenerated, 9)
+  | extend BurstEnd = StartKey == Key and TimeGenerated - StartTime <= window
+  | summarize FailedAttempts = count(), InvalidUserAttempts = countif(InvalidUser), Bursts = countif(BurstEnd),
+      Usernames = make_set(TargetUser, 25), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated)
+      by Computer, SourceIP
+  | where Bursts > 0
+  | project Computer, SourceIP, FailedAttempts, InvalidUserAttempts, Usernames, FirstSeen, LastSeen
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: Computer
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+triage:
+  steps:
+    - Check whether SYSLOG-002 also fired for the same host and IP. If so, work that alert first.
+    - Look at Usernames. Guessing real account names (not just root, admin, test) suggests a targeted attack.
+    - Confirm the host should accept SSH from the internet at all (see AZACT-001 for recently opened ports).
+    - Make sure password authentication is disabled (PasswordAuthentication no) and consider fail2ban or restricting the source range.
+  falsePositives:
+    - Internet background scanning against any host with port 22 open.
+    - An automation account with an expired key retrying in a loop.
+  escalateWhen: |
+    Escalate if real usernames are being targeted, if the host is not supposed to be reachable,
+    or if any login from the same IP succeeded.
+tests:
+  - name: fifteen failures in a few minutes fires and counts invalid users
+    data:
+      Syslog:
+        - { at: -30m, repeat: 10, every: 10s, Computer: web-01, ProcessName: sshd, Facility: auth, SyslogMessage: "Failed password for invalid user admin from 203.0.113.170 port 51122 ssh2" }
+        - { at: -28m, repeat: 5, every: 10s, Computer: web-01, ProcessName: sshd, Facility: auth, SyslogMessage: "Failed password for root from 203.0.113.170 port 51190 ssh2" }
+    expect:
+      rows: 1
+      match: { Computer: web-01, SourceIP: 203.0.113.170, FailedAttempts: 15, InvalidUserAttempts: 10 }
+  - name: newer OpenSSH logging from sshd-session is covered
+    data:
+      Syslog:
+        - { at: -20m, repeat: 12, every: 5s, Computer: web-02, ProcessName: sshd-session, SyslogMessage: "Failed password for ubuntu from 203.0.113.171 port 40022 ssh2" }
+    expect:
+      rows: 1
+      match: { Computer: web-02, FailedAttempts: 12 }
+  - name: a burst that straddles a ten-minute clock boundary still fires
+    data:
+      Syslog:
+        - { at: -25m, repeat: 12, every: 50s, Computer: web-03, ProcessName: sshd, SyslogMessage: "Failed password for root from 203.0.113.172 port 40000 ssh2" }
+    expect:
+      rows: 1
+      match: { Computer: web-03, FailedAttempts: 12 }
+  - name: a few failures spread across an hour do not fire
+    data:
+      Syslog:
+        - { at: -55m, repeat: 9, every: 6m, Computer: web-01, ProcessName: sshd, SyslogMessage: "Failed password for naved from 198.51.100.70 port 50000 ssh2" }
+    expect: { rows: 0 }

@@ -1,0 +1,49 @@
+name: detections
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      kusto:
+        # Free Kusto Query Engine emulator - the same engine Sentinel and Log Analytics use.
+        image: mcr.microsoft.com/azuredataexplorer/kustainer-linux:latest
+        ports:
+          - 8080:8080
+        env:
+          ACCEPT_EULA: "Y"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint rules (schema, ATT&CK fields, KQL semantics, entity mappings)
+        run: npm run lint
+
+      - name: Wait for the Kusto emulator
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf -X POST http://localhost:8080/v1/rest/query \
+                 -H 'Content-Type: application/json' \
+                 -d '{"db":"NetDefaultDB","csl":"print ok=1"}' > /dev/null; then
+              echo "emulator ready"; exit 0
+            fi
+            sleep 5
+          done
+          echo "emulator did not start"; exit 1
+
+      - name: Run rule tests on the emulator
+        run: npm test
+
+      - name: Check generated docs are up to date
+        run: |
+          npm run docs
+          git diff --exit-code -- docs/ || (echo "Run 'npm run docs' and commit the result" && exit 1)

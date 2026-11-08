@@ -1,0 +1,105 @@
+id: ab5bb7a6-c8e8-48bb-b69a-b82094b3f0ba
+ruleId: AUDIT-001
+name: Privileged Entra ID role assigned
+description: |
+  A user was added to a highly privileged Microsoft Entra ID role such as Global Administrator or
+  Privileged Role Administrator. Attackers who take over an admin account add a second account
+  they control so they keep access after the first one is cleaned up.
+severity: High
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes: [AuditLogs]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [Persistence, PrivilegeEscalation]
+relevantTechniques: [T1098.003]
+query: |
+  let lookback = 1h;
+  let privileged_roles = dynamic(["Global Administrator", "Privileged Role Administrator",
+      "Privileged Authentication Administrator", "Security Administrator", "Application Administrator",
+      "Cloud Application Administrator", "User Administrator", "Exchange Administrator",
+      "Conditional Access Administrator", "Hybrid Identity Administrator", "Authentication Administrator"]);
+  AuditLogs
+  | where TimeGenerated > ago(lookback)
+  | where OperationName in ("Add member to role", "Add eligible member to role", "Add member to role outside of PIM (permanent)")
+  | where Result =~ "success"
+  | mv-expand TargetResource = TargetResources
+  | mv-expand ModifiedProperty = TargetResource.modifiedProperties
+  | where tostring(ModifiedProperty.displayName) == "Role.DisplayName"
+  | extend RoleName = trim(@'"', tostring(ModifiedProperty.newValue))
+  | where RoleName in (privileged_roles)
+  | extend TargetUser = tostring(TargetResource.userPrincipalName),
+           InitiatedByUser = tostring(InitiatedBy.user.userPrincipalName),
+           InitiatedByApp = tostring(InitiatedBy.app.displayName),
+           InitiatorIP = tostring(InitiatedBy.user.ipAddress)
+  | where isnotempty(TargetUser)
+  | extend Initiator = iff(isnotempty(InitiatedByUser), InitiatedByUser, InitiatedByApp)
+  | project TimeGenerated, OperationName, RoleName, TargetUser, Initiator, InitiatorIP, CorrelationId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: TargetUser
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: InitiatorIP
+triage:
+  steps:
+    - Find the change request or ticket for this assignment. Privileged role grants should never be a surprise.
+    - Ask the Initiator, out of band, whether they made the change.
+    - Check the Initiator's sign-ins around TimeGenerated - location, device, MFA - for signs the admin account itself was compromised.
+    - Check TargetUser - is it a new account, a guest, or an account with recent risky sign-ins?
+    - If unauthorised, remove the role, disable TargetUser, and investigate the Initiator account as compromised.
+  falsePositives:
+    - Planned admin onboarding or a scheduled Privileged Identity Management (PIM) assignment.
+    - Break-glass account maintenance done by the identity team.
+  escalateWhen: |
+    Escalate if there is no approved change, if the Initiator denies it, or if the role is
+    Global Administrator or Privileged Role Administrator and TargetUser is new or a guest.
+tests:
+  - name: Global Administrator granted to a new user fires
+    data:
+      AuditLogs:
+        - at: -15m
+          OperationName: Add member to role
+          Category: RoleManagement
+          Result: success
+          InitiatedBy: { user: { userPrincipalName: admin@example.com, ipAddress: 203.0.113.100 } }
+          TargetResources:
+            - userPrincipalName: backdoor@example.com
+              type: User
+              modifiedProperties:
+                - { displayName: Role.DisplayName, oldValue: "", newValue: '"Global Administrator"' }
+                - { displayName: Role.TemplateId, oldValue: "", newValue: '"62e90394-69f5-4237-9190-012177145e10"' }
+          CorrelationId: 1d2c3b4a-0000-4000-8000-000000000001
+    expect:
+      rows: 1
+      match: { RoleName: Global Administrator, TargetUser: backdoor@example.com, Initiator: admin@example.com, InitiatorIP: 203.0.113.100 }
+  - name: a low-privilege role does not fire
+    data:
+      AuditLogs:
+        - at: -15m
+          OperationName: Add member to role
+          Result: success
+          InitiatedBy: { user: { userPrincipalName: admin@example.com, ipAddress: 198.51.100.60 } }
+          TargetResources:
+            - userPrincipalName: newhire@example.com
+              modifiedProperties:
+                - { displayName: Role.DisplayName, oldValue: "", newValue: '"Reports Reader"' }
+    expect: { rows: 0 }
+  - name: a failed role assignment does not fire
+    data:
+      AuditLogs:
+        - at: -15m
+          OperationName: Add member to role
+          Result: failure
+          InitiatedBy: { user: { userPrincipalName: admin@example.com } }
+          TargetResources:
+            - userPrincipalName: backdoor@example.com
+              modifiedProperties:
+                - { displayName: Role.DisplayName, oldValue: "", newValue: '"Global Administrator"' }
+    expect: { rows: 0 }

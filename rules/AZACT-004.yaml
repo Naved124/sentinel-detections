@@ -1,0 +1,103 @@
+id: 7bf224de-43b9-4de1-9d1e-f6276e5f2157
+ruleId: AZACT-004
+name: Logging or security monitoring removed in Azure
+description: |
+  A diagnostic setting, Log Analytics workspace, activity log alert or Sentinel analytics rule
+  was deleted. Removing logging and detections is how attackers hide what they do next, so this
+  should always be explained by a change record.
+severity: High
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActivity
+    dataTypes: [AzureActivity]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [DefenseEvasion]
+relevantTechniques: [T1562.008]
+query: |
+  let lookback = 1h;
+  let logging_deletes = dynamic([
+      "MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE",
+      "MICROSOFT.OPERATIONALINSIGHTS/WORKSPACES/DELETE",
+      "MICROSOFT.OPERATIONALINSIGHTS/WORKSPACES/DATASOURCES/DELETE",
+      "MICROSOFT.INSIGHTS/ACTIVITYLOGALERTS/DELETE",
+      "MICROSOFT.INSIGHTS/DATACOLLECTIONRULES/DELETE",
+      "MICROSOFT.SECURITYINSIGHTS/ALERTRULES/DELETE",
+      "MICROSOFT.SECURITYINSIGHTS/DATACONNECTORS/DELETE"]);
+  AzureActivity
+  | where TimeGenerated > ago(lookback)
+  | where toupper(OperationNameValue) in (logging_deletes)
+  | summarize arg_max(TimeGenerated, OperationNameValue, ActivityStatusValue, Caller, CallerIpAddress, _ResourceId)
+      by CorrelationId
+  | extend WhatWasRemoved = case(
+      OperationNameValue has "DIAGNOSTICSETTINGS", "diagnostic setting",
+      OperationNameValue has "DATASOURCES", "workspace data source",
+      OperationNameValue has "WORKSPACES", "Log Analytics workspace",
+      OperationNameValue has "ACTIVITYLOGALERTS", "activity log alert",
+      OperationNameValue has "DATACOLLECTIONRULES", "data collection rule",
+      OperationNameValue has "ALERTRULES", "Sentinel analytics rule",
+      OperationNameValue has "DATACONNECTORS", "Sentinel data connector",
+      "logging resource")
+  | project TimeGenerated, WhatWasRemoved, FinalStatus = ActivityStatusValue, Caller, CallerIpAddress, _ResourceId,
+      OperationNameValue, CorrelationId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Caller
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: CallerIpAddress
+  - entityType: AzureResource
+    fieldMappings:
+      - identifier: ResourceId
+        columnName: _ResourceId
+triage:
+  steps:
+    - Identify exactly what stopped being logged or detected, using _ResourceId.
+    - Confirm the deletion with the Caller and change records.
+    - Review everything the Caller did in Azure in the hours before and after TimeGenerated.
+    - Restore the setting or rule, then search other data sources for activity during the gap.
+  falsePositives:
+    - Planned clean-up of test resources or decommissioned workspaces.
+    - Infrastructure-as-code redeployments that delete and recreate diagnostic settings.
+  escalateWhen: |
+    Escalate if the deletion was not planned, or if the Caller's other activity around the same
+    time looks unusual.
+tests:
+  - name: deleting a diagnostic setting fires
+    data:
+      AzureActivity:
+        - at: -10m
+          OperationNameValue: Microsoft.Insights/diagnosticSettings/delete
+          ActivityStatusValue: Success
+          Caller: deploy-ci@example.com
+          CallerIpAddress: 203.0.113.160
+          CorrelationId: 3c2b1a0f-0000-4000-8000-000000000001
+          _ResourceId: /subscriptions/0/resourceGroups/prod-rg/providers/Microsoft.KeyVault/vaults/prod-kv/providers/microsoft.insights/diagnosticSettings/to-sentinel
+    expect:
+      rows: 1
+      match: { WhatWasRemoved: diagnostic setting, Caller: deploy-ci@example.com }
+  - name: deleting a Sentinel analytics rule fires
+    data:
+      AzureActivity:
+        - at: -10m
+          OperationNameValue: MICROSOFT.SECURITYINSIGHTS/ALERTRULES/DELETE
+          ActivityStatusValue: Success
+          Caller: admin@example.com
+          CorrelationId: 3c2b1a0f-0000-4000-8000-000000000002
+    expect:
+      rows: 1
+      match: { WhatWasRemoved: Sentinel analytics rule }
+  - name: creating a diagnostic setting does not fire
+    data:
+      AzureActivity:
+        - at: -10m
+          OperationNameValue: MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/WRITE
+          ActivityStatusValue: Success
+          Caller: admin@example.com
+          CorrelationId: 3c2b1a0f-0000-4000-8000-000000000003
+    expect: { rows: 0 }

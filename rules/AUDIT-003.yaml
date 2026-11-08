@@ -1,0 +1,116 @@
+id: 96551296-c7b5-48dd-9313-91d38109b731
+ruleId: AUDIT-003
+name: Conditional Access policy deleted or disabled
+description: |
+  A Conditional Access policy was deleted or switched off. Conditional Access is what enforces MFA,
+  blocks legacy authentication and restricts risky sign-ins, so turning a policy off quietly
+  removes those protections for everyone it covered.
+severity: High
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes: [AuditLogs]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [DefenseEvasion, Persistence]
+relevantTechniques: [T1556.009]
+query: |
+  let lookback = 1h;
+  let changes = AuditLogs
+      | where TimeGenerated > ago(lookback)
+      | where Result =~ "success"
+      | where OperationName in ("Delete conditional access policy", "Update conditional access policy")
+      | mv-expand TargetResource = TargetResources;
+  let deleted = changes
+      | where OperationName == "Delete conditional access policy"
+      | extend Change = "deleted";
+  // An update only matters when the policy's new state is disabled (re-enabling one is fine).
+  let disabled = changes
+      | where OperationName == "Update conditional access policy"
+      | mv-expand ModifiedProperty = TargetResource.modifiedProperties
+      | where tostring(ModifiedProperty.newValue) matches regex @'state\W{1,6}disabled'
+      | extend Change = "disabled"
+      | project-away ModifiedProperty;
+  union deleted, disabled
+  | extend PolicyName = tostring(TargetResource.displayName),
+           InitiatedByUser = tostring(InitiatedBy.user.userPrincipalName),
+           InitiatedByApp = tostring(InitiatedBy.app.displayName),
+           InitiatorIP = tostring(InitiatedBy.user.ipAddress)
+  | extend Initiator = iff(isnotempty(InitiatedByUser), InitiatedByUser, InitiatedByApp)
+  | summarize arg_max(TimeGenerated, Initiator, InitiatorIP) by CorrelationId, PolicyName, Change
+  | project TimeGenerated, PolicyName, Change, Initiator, InitiatorIP, CorrelationId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Initiator
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: InitiatorIP
+triage:
+  steps:
+    - Identify what the policy enforced (MFA for all users, admin MFA, legacy auth block, location restrictions).
+    - Confirm with the identity team whether a change was approved. Policy changes should go through change control.
+    - Check the Initiator's sign-ins around TimeGenerated for signs of compromise.
+    - Look for sign-ins that the policy would have blocked or challenged, starting from TimeGenerated.
+    - If unapproved, restore the policy and investigate the Initiator account.
+  falsePositives:
+    - Planned policy clean-up or replacement by the identity team.
+    - Temporarily disabling a policy while troubleshooting a sign-in issue.
+  escalateWhen: |
+    Escalate if the change was not approved or the policy enforced MFA or blocked legacy
+    authentication.
+tests:
+  - name: deleting a policy fires
+    data:
+      AuditLogs:
+        - at: -5m
+          OperationName: Delete conditional access policy
+          Result: success
+          InitiatedBy: { user: { userPrincipalName: admin@example.com, ipAddress: 203.0.113.120 } }
+          TargetResources:
+            - { displayName: Require MFA for all users, modifiedProperties: [] }
+    expect:
+      rows: 1
+      match: { PolicyName: Require MFA for all users, Change: deleted, Initiator: admin@example.com }
+  - name: switching a policy to disabled fires
+    data:
+      AuditLogs:
+        - at: -5m
+          OperationName: Update conditional access policy
+          Result: success
+          InitiatedBy: { user: { userPrincipalName: admin@example.com, ipAddress: 203.0.113.120 } }
+          TargetResources:
+            - displayName: Block legacy authentication
+              modifiedProperties:
+                - { displayName: ConditionalAccessPolicy, oldValue: '{"state":"enabled"}', newValue: '{"state":"disabled"}' }
+    expect:
+      rows: 1
+      match: { PolicyName: Block legacy authentication, Change: disabled }
+  - name: re-enabling a disabled policy does not fire
+    data:
+      AuditLogs:
+        - at: -5m
+          OperationName: Update conditional access policy
+          Result: success
+          InitiatedBy: { user: { userPrincipalName: admin@example.com } }
+          TargetResources:
+            - displayName: Block legacy authentication
+              modifiedProperties:
+                - { displayName: ConditionalAccessPolicy, oldValue: '{"state":"disabled"}', newValue: '{"state":"enabled"}' }
+    expect: { rows: 0 }
+  - name: editing an enabled policy does not fire
+    data:
+      AuditLogs:
+        - at: -5m
+          OperationName: Update conditional access policy
+          Result: success
+          InitiatedBy: { user: { userPrincipalName: admin@example.com } }
+          TargetResources:
+            - displayName: Require MFA for all users
+              modifiedProperties:
+                - { displayName: ConditionalAccessPolicy, oldValue: '{"state":"enabledForReportingButNotEnforced"}', newValue: '{"state":"enabled"}' }
+    expect: { rows: 0 }

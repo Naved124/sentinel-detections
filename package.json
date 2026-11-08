@@ -1,0 +1,21 @@
+{
+  "name": "sentinel-detections",
+  "version": "0.1.0",
+  "description": "Microsoft Sentinel detection rules in KQL, mapped to MITRE ATT&CK, with tests and analyst triage playbooks",
+  "private": true,
+  "license": "MIT",
+  "author": "MD Naved Raja Khan",
+  "scripts": {
+    "lint": "node tools/lint.js",
+    "test": "node tools/test.js",
+    "test:offline": "node tools/test.js --offline",
+    "docs": "node tools/docs.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@kusto/language-service-next": "^12.4.1",
+    "js-yaml": "^4.3.2"
+  }
+}

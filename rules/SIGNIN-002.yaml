@@ -1,0 +1,86 @@
+id: f5e7f984-c451-47e7-976d-55543a3a45b4
+ruleId: SIGNIN-002
+name: Successful Entra ID sign-in after brute force
+description: |
+  An account had ten or more failed sign-ins from one IP address and then signed in successfully
+  from that same IP within the hour. The failures alone are noise on any internet-facing tenant;
+  the success afterwards is what makes this worth an analyst's time.
+severity: High
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes: [SigninLogs]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [CredentialAccess, InitialAccess]
+relevantTechniques: [T1110.001, T1078.004]
+query: |
+  let lookback = 1h;
+  let min_failures = 10;
+  let failures = SigninLogs
+      | where TimeGenerated > ago(lookback)
+      | where ResultType in ("50126", "50053")
+      | summarize FailedAttempts = count(), FirstFailure = min(TimeGenerated), LastFailure = max(TimeGenerated)
+          by UserPrincipalName, IPAddress
+      | where FailedAttempts >= min_failures;
+  let successes = SigninLogs
+      | where TimeGenerated > ago(lookback)
+      | where ResultType == "0"
+      | project SuccessTime = TimeGenerated, UserPrincipalName, IPAddress, AppDisplayName, ClientAppUsed, AuthenticationRequirement;
+  failures
+  | join kind=inner successes on UserPrincipalName, IPAddress
+  | where SuccessTime > FirstFailure
+  | summarize arg_min(SuccessTime, AppDisplayName, ClientAppUsed, AuthenticationRequirement)
+      by UserPrincipalName, IPAddress, FailedAttempts, FirstFailure, LastFailure
+  | project UserPrincipalName, IPAddress, FailedAttempts, FirstFailure, LastFailure, SuccessTime,
+      AppDisplayName, ClientAppUsed, AuthenticationRequirement
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: UserPrincipalName
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: IPAddress
+triage:
+  steps:
+    - Check AuthenticationRequirement. singleFactorAuthentication means the password alone was enough, which is the worst case.
+    - Ask the user, through a channel other than their account, whether they signed in at SuccessTime from that location.
+    - Review everything the account did after SuccessTime - mailbox rules, file downloads, MFA method changes, app consents, new devices.
+    - Look up the IP and check whether it hit other accounts (see SIGNIN-001).
+    - If not confirmed by the user, revoke sessions, reset the password and require MFA re-registration.
+  falsePositives:
+    - The user forgot a recently changed password, retried many times and then got it right.
+    - A phone or mail client kept retrying an old saved password before the user updated it.
+  escalateWhen: |
+    Escalate if the user does not confirm the sign-in, if the sign-in was single-factor, or if
+    the account holds an admin role.
+tests:
+  - name: twelve failures then a success from the same IP fires
+    data:
+      SigninLogs:
+        - { at: -40m, repeat: 12, every: 30s, UserPrincipalName: bob@example.com, IPAddress: 203.0.113.60, ResultType: "50126" }
+        - { at: -30m, UserPrincipalName: bob@example.com, IPAddress: 203.0.113.60, ResultType: "0", AppDisplayName: Office 365 Exchange Online, ClientAppUsed: Browser, AuthenticationRequirement: singleFactorAuthentication }
+    expect:
+      rows: 1
+      match: { UserPrincipalName: bob@example.com, IPAddress: 203.0.113.60, FailedAttempts: 12, AuthenticationRequirement: singleFactorAuthentication }
+  - name: failures without a success do not fire
+    data:
+      SigninLogs:
+        - { at: -40m, repeat: 15, every: 20s, UserPrincipalName: bob@example.com, IPAddress: 203.0.113.60, ResultType: "50126" }
+    expect: { rows: 0 }
+  - name: success from a different IP is not linked to the brute force
+    data:
+      SigninLogs:
+        - { at: -40m, repeat: 12, every: 30s, UserPrincipalName: bob@example.com, IPAddress: 203.0.113.60, ResultType: "50126" }
+        - { at: -20m, UserPrincipalName: bob@example.com, IPAddress: 198.51.100.20, ResultType: "0" }
+    expect: { rows: 0 }
+  - name: a success before the failures started does not fire
+    data:
+      SigninLogs:
+        - { at: -55m, UserPrincipalName: bob@example.com, IPAddress: 203.0.113.60, ResultType: "0" }
+        - { at: -40m, repeat: 12, every: 30s, UserPrincipalName: bob@example.com, IPAddress: 203.0.113.60, ResultType: "50126" }
+    expect: { rows: 0 }

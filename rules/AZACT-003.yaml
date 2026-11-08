@@ -1,0 +1,89 @@
+id: 261ac1db-d52d-475c-bfe1-88b789e8e798
+ruleId: AZACT-003
+name: Command run on an Azure VM through Run Command
+description: |
+  Someone used Azure Run Command to execute a script on a virtual machine. Run Command executes
+  as SYSTEM or root through the VM agent, needs no network access to the VM, and is a known way
+  for attackers with Azure permissions to run code on servers.
+severity: Medium
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActivity
+    dataTypes: [AzureActivity]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [Execution]
+relevantTechniques: [T1651]
+query: |
+  let lookback = 1h;
+  AzureActivity
+  | where TimeGenerated > ago(lookback)
+  | where OperationNameValue in~ (
+      "MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION",
+      "MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMANDS/WRITE",
+      "MICROSOFT.COMPUTE/VIRTUALMACHINESCALESETS/VIRTUALMACHINES/RUNCOMMAND/ACTION")
+  | summarize arg_max(TimeGenerated, OperationNameValue, ActivityStatusValue, Caller, CallerIpAddress, _ResourceId, ResourceGroup)
+      by CorrelationId
+  | extend VmName = tostring(split(_ResourceId, "/")[8])
+  | project TimeGenerated, VmName, ResourceGroup, Caller, CallerIpAddress, FinalStatus = ActivityStatusValue,
+      OperationNameValue, _ResourceId, CorrelationId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Caller
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: CallerIpAddress
+  - entityType: AzureResource
+    fieldMappings:
+      - identifier: ResourceId
+        columnName: _ResourceId
+triage:
+  steps:
+    - Ask the Caller what was run and why. Run Command is rarely part of normal operations.
+    - Get the script that ran from the VM's run command history (az vm run-command list) or the VM agent logs.
+    - Check the Caller's sign-ins and other Azure activity around TimeGenerated.
+    - On the VM, look for new users, scheduled tasks, services, cron jobs or outbound connections created after TimeGenerated.
+    - If unexplained, isolate the VM and remove the Caller's Virtual Machine Contributor (or higher) access.
+  falsePositives:
+    - Administrators using Run Command for troubleshooting when SSH or RDP is unavailable.
+    - Configuration management or patching tools that use Run Command.
+  escalateWhen: |
+    Escalate if the Caller cannot explain the command, if the script downloads or launches
+    anything, or if the VM is production.
+tests:
+  - name: Run Command on a VM fires once per operation
+    data:
+      AzureActivity:
+        - at: -30m
+          OperationNameValue: MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION
+          ActivityStatusValue: Start
+          Caller: admin@example.com
+          CallerIpAddress: 203.0.113.150
+          ResourceGroup: prod-rg
+          CorrelationId: 5e4d3c2b-0000-4000-8000-000000000001
+          _ResourceId: /subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/prod-rg/providers/Microsoft.Compute/virtualMachines/db-01
+        - at: -29m
+          OperationNameValue: MICROSOFT.COMPUTE/VIRTUALMACHINES/RUNCOMMAND/ACTION
+          ActivityStatusValue: Success
+          Caller: admin@example.com
+          CallerIpAddress: 203.0.113.150
+          ResourceGroup: prod-rg
+          CorrelationId: 5e4d3c2b-0000-4000-8000-000000000001
+          _ResourceId: /subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/prod-rg/providers/Microsoft.Compute/virtualMachines/db-01
+    expect:
+      rows: 1
+      match: { VmName: db-01, FinalStatus: Success, Caller: admin@example.com }
+  - name: starting a VM is not Run Command
+    data:
+      AzureActivity:
+        - at: -30m
+          OperationNameValue: MICROSOFT.COMPUTE/VIRTUALMACHINES/START/ACTION
+          ActivityStatusValue: Success
+          Caller: admin@example.com
+          CorrelationId: 5e4d3c2b-0000-4000-8000-000000000002
+    expect: { rows: 0 }

@@ -1,0 +1,128 @@
+id: 20578d6a-2a58-4954-a2e3-feeb966e474d
+ruleId: AZACT-001
+name: NSG rule opens a sensitive port to the internet
+description: |
+  A network security group rule was created or changed to allow inbound traffic from any source
+  (*, Internet, 0.0.0.0/0) to a remote-access or database port such as SSH, RDP, MySQL or SQL
+  Server. Attackers open these ports to get back in; admins open them "temporarily" and forget.
+severity: High
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActivity
+    dataTypes: [AzureActivity]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [DefenseEvasion]
+relevantTechniques: [T1562.007]
+query: |
+  let lookback = 1h;
+  let any_source = dynamic(["*", "0.0.0.0/0", "Internet", "Any", "::/0"]);
+  // SSH, RDP, WinRM, SMB, MySQL, MSSQL, PostgreSQL, Redis, MongoDB, Elasticsearch
+  let sensitive_ports = dynamic([22, 3389, 5985, 5986, 445, 3306, 1433, 5432, 6379, 27017, 9200]);
+  AzureActivity
+  | where TimeGenerated > ago(lookback)
+  | where OperationNameValue =~ "MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/SECURITYRULES/WRITE"
+  | extend Rule = parse_json(tostring(Properties_d.requestbody)).properties
+  | where isnotempty(Rule)
+  | where tostring(Rule.direction) =~ "Inbound" and tostring(Rule.access) =~ "Allow"
+  | extend Sources = iff(isnotempty(tostring(Rule.sourceAddressPrefix)),
+                         pack_array(tostring(Rule.sourceAddressPrefix)), Rule.sourceAddressPrefixes)
+  | where array_length(set_intersect(Sources, any_source)) > 0
+  | extend Ports = iff(isnotempty(tostring(Rule.destinationPortRange)),
+                       pack_array(tostring(Rule.destinationPortRange)), Rule.destinationPortRanges)
+  | mv-expand Port = Ports to typeof(string)
+  | extend Bounds = split(Port, "-")
+  | extend Low = iff(Port == "*", 0, toint(Bounds[0])),
+           High = iff(Port == "*", 65535, toint(Bounds[array_length(Bounds) - 1]))
+  | extend Candidates = sensitive_ports
+  | mv-apply Candidate = Candidates to typeof(int) on (where Candidate between (Low .. High))
+  | summarize ExposedPorts = make_set(Candidate), arg_max(TimeGenerated, Caller, CallerIpAddress, _ResourceId, Rule)
+      by CorrelationId
+  | extend NsgName = tostring(split(_ResourceId, "/")[8]), RuleName = tostring(split(_ResourceId, "/")[10])
+  | project TimeGenerated, NsgName, RuleName, ExposedPorts, Caller, CallerIpAddress, _ResourceId,
+      Protocol = tostring(Rule.protocol), Priority = toint(Rule.priority), CorrelationId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Caller
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: CallerIpAddress
+  - entityType: AzureResource
+    fieldMappings:
+      - identifier: ResourceId
+        columnName: _ResourceId
+triage:
+  steps:
+    - Check whether the rule is still there and what it protects (which VMs or subnets use the NSG).
+    - Ask the Caller why the port was opened. Remote access should go through Bastion, a VPN or just-in-time access.
+    - Check the Caller's sign-ins around TimeGenerated for signs the account was compromised.
+    - Look for inbound connections or brute-force attempts on the exposed ports since TimeGenerated (see SYSLOG-001).
+    - Remove or restrict the rule to known source IPs.
+  falsePositives:
+    - A short, approved change during an outage, already reverted.
+    - Lab or sandbox subscriptions that intentionally expose services.
+  escalateWhen: |
+    Escalate if the Caller did not make the change, if the NSG covers production workloads, or if
+    the exposed hosts show logins from new IPs after TimeGenerated.
+tests:
+  - name: SSH and MySQL opened to the internet fires with both ports
+    data:
+      AzureActivity:
+        - at: -20m
+          OperationNameValue: MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/SECURITYRULES/WRITE
+          ActivityStatusValue: Start
+          Caller: admin@example.com
+          CallerIpAddress: 203.0.113.130
+          CorrelationId: 9f8e7d6c-0000-4000-8000-000000000001
+          _ResourceId: /subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/prod-rg/providers/Microsoft.Network/networkSecurityGroups/web-nsg/securityRules/allow-admin
+          Properties_d:
+            requestbody: '{"properties":{"protocol":"Tcp","sourcePortRange":"*","destinationPortRanges":["22","3306","443"],"sourceAddressPrefix":"*","destinationAddressPrefix":"*","access":"Allow","priority":100,"direction":"Inbound"}}'
+        - at: -19m
+          OperationNameValue: MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/SECURITYRULES/WRITE
+          ActivityStatusValue: Success
+          Caller: admin@example.com
+          CallerIpAddress: 203.0.113.130
+          CorrelationId: 9f8e7d6c-0000-4000-8000-000000000001
+          _ResourceId: /subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/prod-rg/providers/Microsoft.Network/networkSecurityGroups/web-nsg/securityRules/allow-admin
+          Properties_d: { statusCode: Created }
+    expect:
+      rows: 1
+      match: { NsgName: web-nsg, RuleName: allow-admin, ExposedPorts: [22, 3306], Caller: admin@example.com }
+  - name: a port range covering RDP is caught
+    data:
+      AzureActivity:
+        - at: -20m
+          OperationNameValue: MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/SECURITYRULES/WRITE
+          Caller: admin@example.com
+          CorrelationId: 9f8e7d6c-0000-4000-8000-000000000002
+          _ResourceId: /subscriptions/0/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/jump-nsg/securityRules/range
+          Properties_d:
+            requestbody: '{"properties":{"protocol":"*","destinationPortRange":"3000-4000","sourceAddressPrefix":"Internet","access":"Allow","direction":"Inbound"}}'
+    expect:
+      rows: 1
+      match: { ExposedPorts: [3306, 3389] }
+  - name: HTTPS open to the internet is not flagged
+    data:
+      AzureActivity:
+        - at: -20m
+          OperationNameValue: MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/SECURITYRULES/WRITE
+          Caller: admin@example.com
+          CorrelationId: 9f8e7d6c-0000-4000-8000-000000000003
+          Properties_d:
+            requestbody: '{"properties":{"protocol":"Tcp","destinationPortRange":"443","sourceAddressPrefix":"*","access":"Allow","direction":"Inbound"}}'
+    expect: { rows: 0 }
+  - name: SSH allowed only from a known office range is not flagged
+    data:
+      AzureActivity:
+        - at: -20m
+          OperationNameValue: MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/SECURITYRULES/WRITE
+          Caller: admin@example.com
+          CorrelationId: 9f8e7d6c-0000-4000-8000-000000000004
+          Properties_d:
+            requestbody: '{"properties":{"protocol":"Tcp","destinationPortRange":"22","sourceAddressPrefixes":["198.51.100.0/24"],"access":"Allow","direction":"Inbound"}}'
+    expect: { rows: 0 }

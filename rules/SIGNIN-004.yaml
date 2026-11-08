@@ -1,0 +1,91 @@
+id: b9ead241-92b2-4382-9ba7-0b746c1568bd
+ruleId: SIGNIN-004
+name: Impossible travel between successful sign-ins
+description: |
+  Two successful sign-ins for the same account came from places at least 500 km apart, closer
+  together in time than a commercial flight could cover (over 900 km/h). This usually means the
+  credentials or a session token are being used by someone else, or the user is behind a VPN.
+severity: Medium
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes: [SigninLogs]
+queryFrequency: 1h
+queryPeriod: 1d
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [InitialAccess]
+relevantTechniques: [T1078.004]
+query: |
+  let lookback = 1d;
+  let max_speed_kmh = 900.0;
+  let min_distance_km = 500.0;
+  SigninLogs
+  | where TimeGenerated > ago(lookback)
+  | where ResultType == "0"
+  | extend Lat = todouble(LocationDetails.geoCoordinates.latitude),
+           Lon = todouble(LocationDetails.geoCoordinates.longitude),
+           Place = strcat(tostring(LocationDetails.city), ", ", tostring(LocationDetails.countryOrRegion))
+  | where isnotnull(Lat) and isnotnull(Lon)
+  | project TimeGenerated, UserPrincipalName, IPAddress, Lat, Lon, Place
+  | sort by UserPrincipalName asc, TimeGenerated asc
+  | extend PrevUser = prev(UserPrincipalName), PrevTime = prev(TimeGenerated), PrevIP = prev(IPAddress),
+           PrevLat = prev(Lat), PrevLon = prev(Lon), PrevPlace = prev(Place)
+  | where PrevUser == UserPrincipalName
+  | extend DistanceKm = geo_distance_2points(PrevLon, PrevLat, Lon, Lat) / 1000.0,
+           Hours = (TimeGenerated - PrevTime) / 1h
+  | extend SpeedKmh = iff(Hours <= 0.0, real(+inf), DistanceKm / Hours)
+  | where DistanceKm >= min_distance_km and SpeedKmh > max_speed_kmh
+  | project UserPrincipalName, FirstTime = PrevTime, FirstIP = PrevIP, FirstPlace = PrevPlace,
+      SecondTime = TimeGenerated, IPAddress, SecondPlace = Place,
+      DistanceKm = round(DistanceKm, 0), SpeedKmh = round(SpeedKmh, 0)
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: UserPrincipalName
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: IPAddress
+triage:
+  steps:
+    - Look up both IPs. If either belongs to a VPN, proxy or cloud provider, check whether the user or company uses that service.
+    - Ask the user where they were at FirstTime and SecondTime and which devices they used.
+    - Compare user agents and devices for the two sign-ins. A device the user has never used before is a strong signal.
+    - Review activity from the second session - mailbox access, file downloads, MFA changes, app consents.
+    - If the user cannot explain it, revoke sessions and reset the password.
+  falsePositives:
+    - Corporate or personal VPNs and secure web gateways that exit in another country.
+    - Mobile carriers that geolocate phones to a distant gateway city.
+    - IP geolocation errors, which are common for new or reassigned IP ranges.
+  escalateWhen: |
+    Escalate if the user did not travel, does not use a VPN that explains the second location,
+    and the second session did anything beyond reading mail.
+tests:
+  - name: Mumbai then Frankfurt 40 minutes later fires
+    data:
+      SigninLogs:
+        - { at: -2h, UserPrincipalName: dave@example.com, IPAddress: 198.51.100.40, ResultType: "0", LocationDetails: { city: Mumbai, countryOrRegion: IN, geoCoordinates: { latitude: 19.07, longitude: 72.88 } } }
+        - { at: -80m, UserPrincipalName: dave@example.com, IPAddress: 203.0.113.80, ResultType: "0", LocationDetails: { city: Frankfurt, countryOrRegion: DE, geoCoordinates: { latitude: 50.11, longitude: 8.68 } } }
+    expect:
+      rows: 1
+      match: { UserPrincipalName: dave@example.com, IPAddress: 203.0.113.80, FirstPlace: "Mumbai, IN", SecondPlace: "Frankfurt, DE" }
+  - name: Mumbai then Delhi six hours later is plausible travel
+    data:
+      SigninLogs:
+        - { at: -10h, UserPrincipalName: dave@example.com, IPAddress: 198.51.100.40, ResultType: "0", LocationDetails: { city: Mumbai, countryOrRegion: IN, geoCoordinates: { latitude: 19.07, longitude: 72.88 } } }
+        - { at: -4h, UserPrincipalName: dave@example.com, IPAddress: 198.51.100.41, ResultType: "0", LocationDetails: { city: Delhi, countryOrRegion: IN, geoCoordinates: { latitude: 28.61, longitude: 77.21 } } }
+    expect: { rows: 0 }
+  - name: two different users in distant cities are not compared
+    data:
+      SigninLogs:
+        - { at: -2h, UserPrincipalName: dave@example.com, IPAddress: 198.51.100.40, ResultType: "0", LocationDetails: { city: Mumbai, countryOrRegion: IN, geoCoordinates: { latitude: 19.07, longitude: 72.88 } } }
+        - { at: -100m, UserPrincipalName: erin@example.com, IPAddress: 203.0.113.80, ResultType: "0", LocationDetails: { city: Frankfurt, countryOrRegion: DE, geoCoordinates: { latitude: 50.11, longitude: 8.68 } } }
+    expect: { rows: 0 }
+  - name: a failed sign-in from far away is ignored
+    data:
+      SigninLogs:
+        - { at: -2h, UserPrincipalName: dave@example.com, IPAddress: 198.51.100.40, ResultType: "0", LocationDetails: { city: Mumbai, countryOrRegion: IN, geoCoordinates: { latitude: 19.07, longitude: 72.88 } } }
+        - { at: -100m, UserPrincipalName: dave@example.com, IPAddress: 203.0.113.80, ResultType: "50126", LocationDetails: { city: Frankfurt, countryOrRegion: DE, geoCoordinates: { latitude: 50.11, longitude: 8.68 } } }
+    expect: { rows: 0 }

@@ -1,0 +1,79 @@
+id: a33f89b3-14a9-4e15-8efa-0762fce4bde0
+ruleId: SYSLOG-003
+name: Sudo used for a root shell or a sensitive change
+description: |
+  A user ran sudo to open a root shell, read credential files, edit sudoers, add users or set a
+  setuid bit. These are the first things an attacker does after landing on a Linux host, and they
+  are rare enough in normal administration to be worth a look.
+severity: Medium
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: Syslog
+    dataTypes: [Syslog]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [PrivilegeEscalation]
+relevantTechniques: [T1548.003]
+query: |
+  let lookback = 1h;
+  let sensitive = @"(^|[\s/])(bash|sh|zsh|dash|su)(\s|$)|/etc/(shadow|gshadow|sudoers)|\.aws/credentials|\.ssh/authorized_keys|(^|[\s/])(visudo|useradd|adduser|usermod|passwd)(\s|$)|chmod\s+[ugoa]*\+s|chmod\s+[0-7]?[4-7][0-7]{3}\s";
+  Syslog
+  | where TimeGenerated > ago(lookback)
+  | where ProcessName == "sudo"
+  | where SyslogMessage has "COMMAND="
+  | extend SudoUser = trim(@"\s+", extract(@"^\s*(\S+)\s+:", 1, SyslogMessage)),
+           RunAs = extract(@"USER=(\S+)\s*;", 1, SyslogMessage),
+           Command = trim(@"\s+", extract(@"COMMAND=(.*)$", 1, SyslogMessage)),
+           Denied = SyslogMessage has "incorrect password" or SyslogMessage has "NOT in sudoers" or SyslogMessage has "command not allowed"
+  | where Command matches regex sensitive
+  | summarize Commands = make_set(Command, 20), Runs = count(), DeniedRuns = countif(Denied),
+      FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated)
+      by Computer, SudoUser, RunAs
+  | project Computer, SudoUser, RunAs, Commands, Runs, DeniedRuns, FirstSeen, LastSeen
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: Computer
+  - entityType: Account
+    fieldMappings:
+      - identifier: Name
+        columnName: SudoUser
+triage:
+  steps:
+    - Check who SudoUser is and whether they normally administer this host.
+    - Check how they logged in - correlate with SSH logins on the same host (SYSLOG-002).
+    - Look at what followed in the logs and shell history - new users, changed keys, downloaded files, services or cron jobs.
+    - If DeniedRuns is above zero, someone tried commands they are not allowed to run, which suggests a compromised low-privilege account.
+    - If not expected, disable the account, rotate credentials on the host, and look for persistence.
+  falsePositives:
+    - Administrators opening a root shell for maintenance.
+    - Provisioning scripts that add users or set permissions during deployment.
+  escalateWhen: |
+    Escalate if the user does not normally administer the host, if credential files were read,
+    or if the session started from an SSH login flagged by SYSLOG-002.
+tests:
+  - name: reading /etc/shadow and opening a root shell fires once per user
+    data:
+      Syslog:
+        - { at: -20m, Computer: web-01, ProcessName: sudo, SyslogMessage: "  deploy : TTY=pts/1 ; PWD=/home/deploy ; USER=root ; COMMAND=/usr/bin/cat /etc/shadow" }
+        - { at: -19m, Computer: web-01, ProcessName: sudo, SyslogMessage: "  deploy : TTY=pts/1 ; PWD=/home/deploy ; USER=root ; COMMAND=/bin/bash" }
+    expect:
+      rows: 1
+      match: { Computer: web-01, SudoUser: deploy, RunAs: root, Runs: 2, DeniedRuns: 0 }
+  - name: a denied attempt to edit sudoers is counted
+    data:
+      Syslog:
+        - { at: -20m, Computer: web-01, ProcessName: sudo, SyslogMessage: "  www-data : 3 incorrect password attempts ; TTY=pts/2 ; PWD=/tmp ; USER=root ; COMMAND=/usr/sbin/visudo" }
+    expect:
+      rows: 1
+      match: { SudoUser: www-data, DeniedRuns: 1 }
+  - name: routine sudo commands do not fire
+    data:
+      Syslog:
+        - { at: -20m, Computer: web-01, ProcessName: sudo, SyslogMessage: "  naved : TTY=pts/0 ; PWD=/home/naved ; USER=root ; COMMAND=/usr/bin/systemctl restart nginx" }
+        - { at: -18m, Computer: web-01, ProcessName: sudo, SyslogMessage: "  naved : TTY=pts/0 ; PWD=/home/naved ; USER=root ; COMMAND=/usr/bin/apt upgrade -y" }
+        - { at: -15m, Computer: web-01, ProcessName: sudo, SyslogMessage: "  naved : TTY=pts/0 ; PWD=/home/naved ; USER=root ; COMMAND=/usr/bin/tail -n 50 /var/log/nginx/error.log" }
+    expect: { rows: 0 }

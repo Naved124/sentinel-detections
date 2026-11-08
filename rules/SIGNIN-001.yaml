@@ -1,0 +1,91 @@
+id: c1498654-31ac-4f24-bb98-3ff61a85986b
+ruleId: SIGNIN-001
+name: Password spraying against Entra ID from one IP
+description: |
+  One IP address failed to sign in as five or more different accounts within an hour. Password
+  spraying tries one or two common passwords against many accounts to stay under per-account
+  lockout limits. The alert also lists any of the targeted accounts that then signed in
+  successfully from the same IP, which is the case to investigate first.
+severity: Medium
+kind: Scheduled
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes: [SigninLogs]
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics: [CredentialAccess]
+relevantTechniques: [T1110.003]
+query: |
+  let lookback = 1h;
+  let min_accounts = 5;
+  // 50126 bad username or password, 50053 locked or blocked, 50055 expired, 50056 invalid or null password
+  let failure_codes = dynamic(["50126", "50053", "50055", "50056"]);
+  let failures = SigninLogs
+      | where TimeGenerated > ago(lookback)
+      | where ResultType in (failure_codes)
+      | summarize
+          TargetedAccounts = dcount(UserPrincipalName),
+          FailedAttempts = count(),
+          Accounts = make_set(UserPrincipalName, 100),
+          FirstSeen = min(TimeGenerated),
+          LastSeen = max(TimeGenerated)
+          by IPAddress
+      | where TargetedAccounts >= min_accounts;
+  let successes = SigninLogs
+      | where TimeGenerated > ago(lookback)
+      | where ResultType == "0"
+      | summarize SucceededAccounts = make_set(UserPrincipalName, 100) by IPAddress;
+  failures
+  | join kind=leftouter successes on IPAddress
+  | extend CompromisedAccounts = set_intersect(Accounts, coalesce(SucceededAccounts, dynamic([])))
+  | extend CompromisedCount = array_length(CompromisedAccounts)
+  | project IPAddress, TargetedAccounts, FailedAttempts, CompromisedCount, CompromisedAccounts, Accounts, FirstSeen, LastSeen
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: IPAddress
+triage:
+  steps:
+    - Check CompromisedCount first. Any account listed there signed in from the spraying IP, so treat it as compromised until shown otherwise.
+    - Look up the IP (owner, ASN, hosting or VPN provider, reputation). Spraying almost always comes from cloud hosting, VPNs or proxies.
+    - For each compromised account, review its sign-ins after the success time - new devices, new countries, mailbox rules, MFA method changes, app consents.
+    - Check whether the same IP appears in other alerts or against other tenants you monitor.
+    - Contain compromised accounts - revoke sessions, reset the password, require MFA re-registration.
+  falsePositives:
+    - A shared corporate egress IP or VPN gateway where many users mistype passwords after a password policy change.
+    - An internal tool or migration script using stale credentials for several service accounts.
+  escalateWhen: |
+    Escalate immediately if CompromisedCount is above zero, or if the targeted accounts include
+    administrators or executives.
+tests:
+  - name: spray across 6 accounts with one success fires and names the compromised account
+    data:
+      SigninLogs:
+        - { at: -50m, UserPrincipalName: alice@example.com, IPAddress: 203.0.113.50, ResultType: "50126" }
+        - { at: -48m, UserPrincipalName: bob@example.com, IPAddress: 203.0.113.50, ResultType: "50126" }
+        - { at: -46m, UserPrincipalName: carol@example.com, IPAddress: 203.0.113.50, ResultType: "50126" }
+        - { at: -44m, UserPrincipalName: dave@example.com, IPAddress: 203.0.113.50, ResultType: "50053" }
+        - { at: -42m, UserPrincipalName: erin@example.com, IPAddress: 203.0.113.50, ResultType: "50126" }
+        - { at: -40m, UserPrincipalName: frank@example.com, IPAddress: 203.0.113.50, ResultType: "50126" }
+        - { at: -39m, UserPrincipalName: frank@example.com, IPAddress: 203.0.113.50, ResultType: "0" }
+        - { at: -30m, UserPrincipalName: alice@example.com, IPAddress: 198.51.100.7, ResultType: "0" }
+    expect:
+      rows: 1
+      match: { IPAddress: 203.0.113.50, TargetedAccounts: 6, CompromisedCount: 1, CompromisedAccounts: [frank@example.com] }
+  - name: one user mistyping a password many times is not spraying
+    data:
+      SigninLogs:
+        - { at: -30m, repeat: 8, every: 1m, UserPrincipalName: alice@example.com, IPAddress: 198.51.100.7, ResultType: "50126" }
+    expect: { rows: 0 }
+  - name: spray older than the lookback window is ignored
+    data:
+      SigninLogs:
+        - { at: -3h, UserPrincipalName: a1@example.com, IPAddress: 203.0.113.51, ResultType: "50126" }
+        - { at: -3h, UserPrincipalName: a2@example.com, IPAddress: 203.0.113.51, ResultType: "50126" }
+        - { at: -3h, UserPrincipalName: a3@example.com, IPAddress: 203.0.113.51, ResultType: "50126" }
+        - { at: -3h, UserPrincipalName: a4@example.com, IPAddress: 203.0.113.51, ResultType: "50126" }
+        - { at: -3h, UserPrincipalName: a5@example.com, IPAddress: 203.0.113.51, ResultType: "50126" }
+    expect: { rows: 0 }
